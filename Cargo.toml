@@ -1,0 +1,27 @@
+[package]
+name = "goap"
+version = "0.1.0"
+authors = ["Walter Pearce <jaynus@gmail.com>"]
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+edition = "2018"
+
+[dependencies]
+# Utility stuff
+log = { version = "0.4", features = ["std"] }
+fern = {version = "0.5", features = ["colored"] }
+chrono = "*"
+failure = "*"
+rayon = "*"
+crossbeam = "*"
+serde = { version = "^1.0", optional = true }
+serde_derive = { version = "^1.0", optional = true }
+pathfinding = "*"
+specs = "*"
+
+[features]
+default = [ ]
+use_serde = [ "serde", "serde_derive" ]
+
+[dev-dependencies]
+serde_json = "^1.0"
