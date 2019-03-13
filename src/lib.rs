@@ -1,341 +1,446 @@
 #![cfg_attr(feature="cargo-clippy", warn(clippy, clippy_correctness, clippy_style, clippy_pedantic, clippy_perf))]
-#![feature(nll, crate_visibility_modifier, integer_atomics)]
+#![feature(nll, crate_visibility_modifier, integer_atomics, associated_type_defaults)]
 #![warn(rust_2018_idioms)]
 
-use std::sync::atomic::{Ordering, AtomicU32};
+use std::sync::atomic::{Ordering, AtomicU32, ATOMIC_U32_INIT};
 #[allow(unused_imports)]
 use log::{info, trace, warn, error, debug};
 #[allow(unused_imports)]
-use fern;
 use std::hash::{Hash, Hasher};
+use std::collections::HashMap;
 
-
-use specs::storage::{DenseVecStorage, UnprotectedStorage};
+#[cfg(feature="serde")]
+#[macro_use] extern crate serde;
 
 pub type Index = u32;
-pub static INVALID_ID: u32 = std::u32::MAX;
+pub const INVALID_ID: u32 = std::u32::MAX;
 
-pub const CONDITION_CAUSE_LIMIT: usize = 16;
+static ID_COUNTER: AtomicU32 = ATOMIC_U32_INIT;
 
 pub trait Indexable {
     fn id(&self) -> Index;
+    fn set_id(&mut self, id: Index) -> Index;
+    fn name(&self) -> &str;
 }
 
-enum ConditionType<'a> {
+#[derive(Clone)]
+#[cfg_attr(feature="serde", derive(Serialize, Deserialize))]
+pub enum ConditionValue
+{
     Value(bool),
-    Eval(&'a mut dyn Fn(&Condition<'a>, &Goap<'a>, ) -> bool),
+    Script(String),
+    #[cfg_attr(feature="serde", serde(skip_serializing, skip_deserializing))]
+    Function(Box<fn(&Condition) -> bool>),
 }
-impl<'a> std::fmt::Debug for ConditionType<'a> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            ConditionType::Value(v) => { write!(f, "{}", v) },
-            ConditionType::Eval(_) => { write!(f, "Function") }
-        }
+impl Default for ConditionValue {
+    fn default() -> ConditionValue {
+        ConditionValue::Value(false)
     }
 }
-impl<'a> PartialEq for ConditionType<'a> {
-    fn eq(&self, other: &ConditionType<'a>) -> bool {
-        match self {
-            ConditionType::Value(v) => {
-                match other {
-                    ConditionType::Value(v_other) => { v == v_other},
-                    ConditionType::Eval(_) => { false }
-                }
-            },
-            ConditionType::Eval(_) => { false }
-        }
-    }
-}
-impl<'a> Eq for ConditionType<'a> { }
 
-pub struct Condition<'a> {
+#[derive(Default, Clone)]
+#[cfg_attr(feature="serde", derive(Serialize, Deserialize))]
+pub struct Condition
+{
+    #[cfg_attr(feature="serde", serde(default))]
     id: Index,
-    value: ConditionType<'a>,
+    name: String,
+    value: ConditionValue,
 }
-impl<'a> Indexable for Condition<'a> {
-    fn id(&self, ) -> Index { self.id }
-}
-impl<'a> Default for Condition<'a> {
-    fn default() -> Self {
-        Self {
-            id: INVALID_ID,
-            value: ConditionType::Value(false),
-        }
-    }
-}
-impl<'a> Condition<'a> {
-    pub fn new(id: Index) -> Self {
+impl Condition {
+    pub fn new(name: &str,) -> Self {
         let mut selfie = Self::default();
-        selfie.id = id;
+        selfie.name = name.to_string();
+        selfie.id = ID_COUNTER.fetch_add(1, Ordering::SeqCst);
         selfie
     }
 
-    pub fn with_eval(mut self, f: &'a mut dyn Fn(&Condition<'a>, &Goap<'a>, ) -> bool) -> Self {
-        self.value = ConditionType::Eval(f);
+    pub fn with_value(mut self, value: ConditionValue) -> Self {
+        self.value = value;
         self
     }
 
-    pub fn eval(&self, goap: &Goap<'a>) -> bool {
+    pub fn eval(&self) -> bool {
         match &self.value {
-            ConditionType::Value(v) => *v,
-            ConditionType::Eval(f) => (*f)(self, goap),
+            ConditionValue::Value(v) => *v,
+            ConditionValue::Function(f) => f(self),
+            ConditionValue::Script(_) => panic!("String hasn't been converted to a function!"),
         }
     }
-}
-impl<'a> Into<Index> for Condition<'a> {
-    fn into(self) -> u32 {
-        self.id
+
+    pub fn set(mut self, value: bool) -> Self {
+        self.value = ConditionValue::Value(value);
+        self
     }
 }
-impl<'a> Hash for Condition<'a> {
+impl Indexable for Condition {
+    fn id(&self) -> Index { self.id }
+    fn set_id(&mut self, id: Index) -> Index { self.id = id; id }
+    fn name(&self) -> &str { self.name.as_str() }
+}
+impl Hash for Condition {
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.id.hash(state);
     }
 }
-impl<'a> std::fmt::Debug for Condition<'a> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "Condition [id={}, value={:?}]", self.id, self.value)
+impl PartialEq for Condition {
+    fn eq(&self, other: &Condition) -> bool {
+        self.id == other.id
     }
 }
+impl Eq for Condition {}
 
-pub struct Action<'a> {
+#[derive(Default, Clone)]
+#[cfg_attr(feature="serde", derive(Serialize, Deserialize))]
+pub struct Action {
+    #[cfg_attr(feature="serde", serde(default))]
     id: Index,
-    conditions: [Option<&'a Condition<'a>>; CONDITION_CAUSE_LIMIT],
-    conditions_count: usize,
-    causes: [Option<&'a Condition<'a>>; CONDITION_CAUSE_LIMIT],
-    causes_count: usize,
-    cost_fn: Option<&'a mut dyn Fn(&Action<'_>, &Goap<'_>, ) -> u32>,
-    effect_fn: Option<&'a mut dyn Fn(&Action<'_>, &Goap<'_>, )>,
+    name: String,
+    conditions: Vec<Condition>,
+    causes: Vec<Condition>,
+
+    #[cfg_attr(feature="serde", serde(skip_serializing, skip_deserializing))]
+    cost_fn: Option<Box<fn(&Action) -> u32>>,
+    #[cfg_attr(feature="serde", serde(skip_serializing, skip_deserializing))]
+    effect_fn: Option<Box<fn(&Action)>>,
 }
-impl<'a> Indexable for Action<'a> {
-    fn id(&self, ) -> Index { self.id }
-}
-impl<'a> Default for Action<'a> {
-    fn default() -> Self {
-        Self {
-            id: INVALID_ID,
-            conditions: [None; CONDITION_CAUSE_LIMIT],
-            conditions_count: 0,
-            causes: [None; CONDITION_CAUSE_LIMIT],
-            causes_count: 0,
-            cost_fn: None,
-            effect_fn: None,
-        }
-    }
-}
-impl<'a> Action<'a> {
-    pub fn new(id: Index) -> Self {
+impl Action {
+    pub fn new(name: &str,) -> Self {
         let mut selfie = Self::default();
-        selfie.id = id;
+        selfie.name = name.to_string();
+        selfie.id = ID_COUNTER.fetch_add(1, Ordering::SeqCst);
         selfie
     }
 
-    pub fn with_condition(mut self, condition: &'a Condition<'a>, ) -> Self {
-        if self.conditions_count + 1 > CONDITION_CAUSE_LIMIT {
-            panic!("Condition overflow");
-        }
-
-        self.conditions[self.conditions_count] = Some(condition);
-        self.conditions_count += 1;
-
-        self
-    }
-    pub fn with_conditions(mut self, src: &[Option<&'a Condition<'a>>], ) -> Self {
-        if src.len() + self.conditions_count > CONDITION_CAUSE_LIMIT {
-            panic!("Slice too big");
-        }
-
-        for n in self.conditions_count..src.len() {
-            self.conditions[n] = src[n];
-        }
-
-        self.conditions_count += src.len();
-
-        self
+    pub fn conditions(&self) -> &Vec<Condition> {
+        &self.conditions
     }
 
-    pub fn with_cause(mut self, condition: &'a Condition<'a>, ) -> Self {
-        if self.causes_count + 1 > CONDITION_CAUSE_LIMIT {
-            panic!("Condition overflow");
-        }
+    pub fn causes(&self) -> &Vec<Condition> {
+        &self.causes
+    }
 
-        self.conditions[self.causes_count] = Some(condition);
-        self.causes_count += 1;
+    pub fn conditions_mut(&mut self) -> &mut Vec<Condition> {
+        &mut self.conditions
+    }
 
+    pub fn causes_mut(&mut self) -> &mut Vec<Condition> {
+        &mut self.causes
+    }
+
+    pub fn with_condition(mut self, condition: Condition) -> Self {
+        self.conditions.push(condition);
         self
     }
-    pub fn with_causes(mut self, src: &[Option<&'a Condition<'a>>], ) -> Self {
-        if src.len() + self.causes_count > CONDITION_CAUSE_LIMIT {
-            panic!("Slice too big");
-        }
-
-        for n in self.causes_count..src.len() {
-            self.causes[n] = src[n];
-        }
-
-        self.causes_count += src.len();
-
+    pub fn with_cause(mut self, condition: Condition) -> Self {
+        self.causes.push(condition);
         self
     }
 
-    pub fn with_cost(mut self, costfn: &'a mut dyn Fn(&Action<'_>, &Goap<'_>, ) -> u32) -> Self {
-        self.cost_fn = Some(costfn);
+    pub fn cost(&self) -> u32 {
+        match &self.cost_fn {
+            Some(f) => f(self),
+            None => 0,
+        }
+    }
+    pub fn do_effect(&self) {
+        match &self.effect_fn {
+            Some(f) => f(self),
+            None => {},
+        }
+    }
+
+    pub fn with_cost(mut self, cost_fn: Option<fn(&Action) -> u32>) -> Self {
+        self.cost_fn = match cost_fn {
+            Some(f) => Some(Box::new(f)),
+            None => None,
+        };
+        self
+    }
+    pub fn with_effect(mut self, effect_fn: Option<fn(&Action)>) -> Self {
+        self.effect_fn = match effect_fn {
+            Some(f) => Some(Box::new(f)),
+            None => None,
+        };
         self
     }
 
-    pub fn with_effect(mut self, effectfn: &'a mut dyn Fn(&Action<'_>, &Goap<'_>, )) -> Self {
-        self.effect_fn = Some(effectfn);
-        self
+    pub fn can_apply(&self, state: &State) -> bool {
+        for condition in &self.conditions {
+            if let Some(state_condition) = state.conditions().get(&condition.id()) {
+                if condition.eval() != state_condition.eval() {
+                    return false;
+                }
+            } else {
+                return false;
+            }
+        }
+
+        true
+    }
+
+    pub fn apply(&self, state: &mut StateSnapshot) {
+        for condition in &self.conditions {
+            state.conditions_mut().insert(condition.id(), condition.eval());
+        }
     }
 }
-impl<'a> Into<Index> for Action<'a> {
-    fn into(self) -> u32 {
-        self.id
-    }
+impl Indexable for Action {
+    fn id(&self) -> Index { self.id }
+    fn set_id(&mut self, id: Index) -> Index { self.id = id; id}
+    fn name(&self) -> &str { self.name.as_str() }
 }
-impl<'a> Hash for Action<'a> {
+impl Hash for Action {
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.id.hash(state);
     }
 }
-impl<'a> std::fmt::Debug for Action<'a> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "Action [ id={} ]", self.id())
+impl PartialEq for Action {
+    fn eq(&self, other: &Action) -> bool {
+        self.id == other.id
     }
 }
+impl Eq for Action {}
 
 
+#[derive(Default, Clone)]
+#[cfg_attr(feature="serde", derive(Serialize, Deserialize))]
 pub struct State {
-    conditions: Vec<Index>,
+    conditions: HashMap<Index, Condition>,
 }
 impl State {
-    pub fn new() -> Self {
-        Self {
-            conditions: Vec::new(),
-        }
+    pub fn conditions(&self, ) -> &HashMap<Index, Condition> {
+        &self.conditions
     }
 
-    pub fn iter<'a>(&'a self, goap: &'a Goap<'a>, ) -> StateIter<'a> {
-        StateIter::new(goap, self.conditions.iter())
-    }
-
-    pub fn with_conditions(mut self, conditions: &[&Condition<'_>], ) -> Self {
-        conditions.iter().for_each(|c| { self.conditions.push(c.id()); });
+    pub fn with_condition(mut self, condition: Condition) -> Self {
+        self.add_condition(condition);
         self
     }
-    pub fn with_condition(mut self, condition: &Condition<'_>, ) -> Self {
-        self.conditions.push(condition.id());
-        self
+    pub fn add_condition(&mut self, condition: Condition) -> &mut Condition {
+        let id = condition.id();
+        self.conditions.insert(condition.id(), condition);
+        self.conditions.get_mut(&id).unwrap()
     }
 
-}
+    pub fn get_by_name(&self, name: &str) -> Option<&Condition> {
+        for (key, value) in &self.conditions {
+            if value.name() == name {
+                return Some(value)
+            }
+        }
+        None
+    }
+    pub fn get(&self, id: Index, ) -> Option<&Condition> {
+        self.conditions.get(&id)
+    }
 
-pub struct StateIter<'a,> {
-    goap: &'a Goap<'a>,
-    inner_iter: std::slice::Iter<'a, Index>,
-}
-impl<'a> StateIter<'a> {
-    fn new(goap: &'a Goap<'a>, inner_iter: std::slice::Iter<'a, Index>,) -> Self {
-        Self {
-            goap,
-            inner_iter,
+    pub fn fix_id<T>(&self, item: &mut T) -> Index
+        where T: Indexable
+    {
+        match self.get_by_name(item.name()) {
+            Some(existing) => { item.set_id(existing.id()); item.id() },
+            None => { item.id() },
         }
     }
 }
-impl<'a> Iterator for StateIter<'a> {
-    type Item = &'a Condition<'a>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        match self.inner_iter.next() {
-            Some(i) => self.goap.get_condition(*i),
-            _ => None,
+impl Hash for State {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.conditions.iter().for_each(|(key, value)| {
+            key.hash(state);
+            value.hash(state);
+        });
+    }
+}
+impl PartialEq for State {
+    fn eq(&self, other: &State) -> bool {
+        for (key, value) in &self.conditions {
+            let other_value = other.conditions.get(key);
+            if let Some(v) = other_value {
+                if v != value {
+                    return false;
+                }
+            } else {
+                return false;
+            }
         }
 
+        true
     }
 }
 
+#[derive(Clone, Default)]
+#[cfg_attr(feature="serde", derive(Serialize, Deserialize))]
 pub struct StateSnapshot {
-    values: std::collections::BTreeMap<Index, bool>,
+    conditions: HashMap<Index, bool>
 }
 impl StateSnapshot {
-    pub fn new<'a>(goap: &'a Goap<'a>, state: &'a State) -> Self {
-        let mut snapshot = Self::default();
+    pub fn new(state: &State) -> Self {
+        let mut ret = Self::default();
+        state.conditions().iter().for_each(|(key, value)| { ret.conditions.insert(*key, value.eval() ); });
+        ret
+    }
 
-        state.iter(goap).for_each(|condition| {
-            snapshot.values.insert(condition.id(), condition.eval(goap));
+    pub fn diff(&self, other: &StateSnapshot) -> usize {
+        let mut count: usize = 0;
+
+        for (key, value) in &self.conditions {
+            let other_value = other.conditions.get(key);
+            if let Some(v) = other_value {
+                if *v != *value {
+                    count += 1;
+                }
+            } else {
+                count += 1;
+            }
+        }
+
+        count
+    }
+
+    pub fn conditions(&self, ) -> &HashMap<Index, bool> {
+        &self.conditions
+    }
+    pub fn conditions_mut(&mut self, ) -> &mut HashMap<Index, bool> {
+        &mut self.conditions
+    }
+
+    pub fn apply(mut self, action: &Action) -> Self {
+        for condition in &action.causes {
+            self.conditions_mut().insert(condition.id(), condition.eval());
+        }
+        self
+    }
+
+    pub fn can_apply(&self, action: &Action) -> bool {
+        for condition in &action.conditions {
+            if let Some(state_condition) = self.conditions().get(&condition.id()) {
+                if condition.eval() != *state_condition {
+                    return false;
+                }
+            } else {
+                return false;
+            }
+        }
+
+        true
+    }
+}
+impl Hash for StateSnapshot {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.conditions.iter().for_each(|(key, value)| {
+            key.hash(state);
+            value.hash(state);
         });
-
-        snapshot
     }
 }
-impl Default for StateSnapshot {
-    fn default() -> Self {
+impl PartialEq for StateSnapshot {
+    fn eq(&self, other: &StateSnapshot) -> bool {
+        for (key, value) in &self.conditions {
+            let other_value = other.conditions.get(key);
+            if let Some(v) = other_value {
+                if *v != *value {
+                    return false;
+                }
+            } else {
+                return false;
+            }
+        }
+
+        true
+    }
+}
+impl PartialEq<State> for StateSnapshot {
+    fn eq(&self, other: &State) -> bool {
+        for (key, value) in &self.conditions {
+            let other_value = other.conditions.get(key);
+            if let Some(v) = other_value {
+                if v.eval() != *value {
+                    return false;
+                }
+            } else {
+                return false;
+            }
+        }
+
+        true
+    }
+}
+
+#[derive(Clone)]
+struct PlanNode<'a> {
+    state: StateSnapshot,
+    action: Option<&'a Action>,
+}
+impl<'a> PlanNode<'a> {
+    pub fn new(state: StateSnapshot, action: Option<&'a Action>) -> Self {
+        trace!("PlanNode::new()");
         Self {
-            values: std::collections::BTreeMap::new(),
+            state,
+            action
         }
+    }
+
+    pub fn iterate(state: StateSnapshot, action: &'a Action) -> PlanNode<'a> {
+        trace!("PlanNode::iterate()");
+        PlanNode::new( state.apply(action), Some(action))
+    }
+
+    pub fn next_nodes(&self, actions: &[&'a Action]) -> Vec<(PlanNode<'a>, usize)> {
+        trace!("PlanNode::next_nodes()");
+        actions.iter().filter_map(|action| {
+            match self.state.can_apply(action) {
+                true => {
+                    trace!("matching action; i={}", action.id());
+                    Some((PlanNode::iterate(self.state.clone(), action), action.cost() as usize))
+                },
+                false => None,
+            }
+        }).collect()
+    }
+
+    pub fn diff(&self, other: &StateSnapshot) -> usize {
+        trace!("PlanNode::diff() = {}", self.state.diff(other));
+        self.state.diff(other)
+    }
+}
+impl<'a> PartialEq for PlanNode<'a> {
+    fn eq(&self, other: &PlanNode<'a>) -> bool {
+        trace!("PlanNode::eq()");
+
+        self.state == other.state
+    }
+}
+impl<'a> Eq for PlanNode<'a> {}
+impl<'a> Hash for PlanNode<'a> {
+    fn hash<H>(&self, state: &mut H)
+        where H: Hasher
+    {
+        if let Some(action) = self.action {
+            action.hash(state);
+        }
+
+        self.state.hash(state);
     }
 }
 
-pub struct Goap<'a> {
-    id_increment: AtomicU32,
-    names: DenseVecStorage<String>,
-    actions: DenseVecStorage<Action<'a>>,
-    conditions: DenseVecStorage<Condition<'a>>,
-}
-impl<'a> Default for Goap<'a> {
-    fn default() -> Self {
-        Self {
-            id_increment: AtomicU32::new(0),
-            names: DenseVecStorage::default(),
-            actions: DenseVecStorage::default(),
-            conditions: DenseVecStorage::default(),
-        }
-    }
-}
-impl<'a> Goap <'a>{
-    pub fn new() -> Self {
-        Self::default()
-    }
-    pub fn new_id(&mut self, ) -> Index {
-        self.id_increment.fetch_add(1, Ordering::SeqCst)
-    }
+pub fn plan<'a>(initial_state: &'a StateSnapshot,
+                goal_state: &StateSnapshot,
+                allowed_actions: &'a [&'a Action])
+                -> Option<Vec<&'a Action>> {
+    // Builds our initial plan node.
+    let start = PlanNode::new( initial_state.clone(), None);
 
-    pub fn new_condition(&mut self, name: &str, ) -> &Condition<'a> {
-        let id = self.new_id();
-
-        unsafe {
-            self.names.insert(id, name.to_string());
-            self.conditions.insert(id, Condition::new(id));
-            self.conditions.get(id)
-        }
-    }
-    pub fn new_action(&mut self, name: &str, ) -> &Action<'a> {
-        let id = self.new_id();
-
-        unsafe {
-            self.names.insert(id, name.to_string());
-            self.actions.insert(id, Action::new(id));
-            self.actions.get(id)
-        }
-    }
-
-    pub fn get_condition(&self, id: Index, ) -> Option<&Condition<'a>> {
-        unsafe {
-            Some(self.conditions.get(id))
-        }
-    }
-    pub fn get_action(&self, id: Index, ) -> Option<&Condition<'a>> {
-        unsafe {
-            Some(self.conditions.get(id))
-        }
-    }
-    pub fn get_name(&self, id: Index, ) -> Option<&str> {
-        unsafe {
-            Some(self.names.get(id).as_str())
-        }
+    // Runs our search over the states graph.
+    if let Some((plan, _)) = pathfinding::prelude::astar(&start,
+                                                         |ref node| node.next_nodes(allowed_actions),
+                                                         |ref node| node.diff(goal_state),
+                                                         |ref node| node.state == *goal_state) {
+        Some(plan.into_iter().skip(1).map(|ref node| node.action.unwrap()).collect())
+    } else {
+        None
     }
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -345,23 +450,89 @@ mod tests {
     static LOGGING_ENABLED: AtomicBool = ATOMIC_BOOL_INIT;
 
     #[test]
-    fn test_state_iterator() {
+    fn test_plan() {
         setup_logger();
-        let mut goap = Goap::new();
 
-        let state1 = State::new().with_conditions(&[
-            goap.new_condition("balls1"),
-        ]);
+        let initial_state = State::default()
+            .with_condition(Condition::new("balls1"))
+            .with_condition(Condition::new("balls2"))
+            .with_condition(Condition::new("balls3"));
 
-        let state2 = State::new()
-            .with_condition(goap.new_condition("balls1"))
-            .with_condition(goap.new_condition("balls2"))
-            .with_condition(goap.new_condition("balls3"));
+        let goal_state = State::default()
+            .with_condition(initial_state.get_by_name("balls1").unwrap().clone().set(true))
+            .with_condition(initial_state.get_by_name("balls2").unwrap().clone().set(true))
+            .with_condition(initial_state.get_by_name("balls3").unwrap().clone().set(true));
 
-        let iter = state2.iter(&goap);
-        iter.for_each(|condition| {
-            trace!("c: {}", goap.get_name(condition.id()).unwrap());
-        });
+        let action1 = Action::new("action1")
+            .with_condition(initial_state.get_by_name("balls1").unwrap().clone().set(false))
+            .with_cause(initial_state.get_by_name("balls1").unwrap().clone().set(true))
+            .with_cause(initial_state.get_by_name("balls2").unwrap().clone().set(false))
+            .with_cause(initial_state.get_by_name("balls3").unwrap().clone().set(false));
+
+        let action2 = Action::new("action2")
+            .with_condition(initial_state.get_by_name("balls1").unwrap().clone().set(true))
+            .with_cause(initial_state.get_by_name("balls2").unwrap().clone().set(true));
+
+        let action3 = Action::new("action3")
+            .with_condition(initial_state.get_by_name("balls2").unwrap().clone().set(true))
+            .with_cause(initial_state.get_by_name("balls3").unwrap().clone().set(true));
+
+        let initial_snapshot = StateSnapshot::new(&initial_state);
+        let goal_snapshot = StateSnapshot::new(&goal_state);
+        let actions = [&action1, &action2, &action3];
+        let the_plan = plan(&initial_snapshot, &goal_snapshot, &actions);
+
+        let plan_ref = the_plan.as_ref().unwrap();
+        assert_eq!(plan_ref.len(), 3);
+
+        assert_eq!(plan_ref[0].name(), "action1");
+        assert_eq!(plan_ref[1].name(), "action2");
+        assert_eq!(plan_ref[2].name(), "action3");
+    }
+
+    #[test]
+    #[cfg(feature="serde")]
+    fn serde_test() {
+        setup_logger();
+        let initial_state = State::default()
+            .with_condition(Condition::new("balls1"))
+            .with_condition(Condition::new("balls2"))
+            .with_condition(Condition::new("balls3"));
+
+        let goal_state = State::default()
+            .with_condition(initial_state.get_by_name("balls1").unwrap().clone().set(true))
+            .with_condition(initial_state.get_by_name("balls2").unwrap().clone().set(true))
+            .with_condition(initial_state.get_by_name("balls3").unwrap().clone().set(true));
+
+        let action1 = Action::new("action1")
+            .with_condition(initial_state.get_by_name("balls1").unwrap().clone().set(false))
+            .with_cause(initial_state.get_by_name("balls1").unwrap().clone().set(true))
+            .with_cause(initial_state.get_by_name("balls2").unwrap().clone().set(false))
+            .with_cause(initial_state.get_by_name("balls3").unwrap().clone().set(false));
+
+        let action2 = Action::new("action2")
+            .with_condition(initial_state.get_by_name("balls1").unwrap().clone().set(true))
+            .with_cause(initial_state.get_by_name("balls2").unwrap().clone().set(true));
+
+        let action3 = Action::new("action3")
+            .with_condition(initial_state.get_by_name("balls2").unwrap().clone().set(true))
+            .with_cause(initial_state.get_by_name("balls3").unwrap().clone().set(true));
+
+        let initial_snapshot = StateSnapshot::new(&initial_state);
+        let goal_snapshot = StateSnapshot::new(&goal_state);
+        let actions = [&action1, &action2, &action3];
+        let the_plan = plan(&initial_snapshot, &goal_snapshot, &actions);
+
+        let plan_ref = the_plan.as_ref().unwrap();
+
+        let s_initial_state = serde_json::to_string_pretty(&initial_state).unwrap();
+        trace!("--------------\ns_initial_state\n{}\n--------------", s_initial_state);
+
+        let s_action = serde_json::to_string_pretty(&action1).unwrap();
+        trace!("--------------\ns_action\n{}\n--------------", s_action);
+
+        let s_initial_snapshot = serde_json::to_string_pretty(&initial_snapshot).unwrap();
+        trace!("--------------\ns_initial_snapshot\n{}\n--------------", s_initial_snapshot);
 
     }
 

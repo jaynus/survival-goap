@@ -8,20 +8,15 @@ edition = "2018"
 
 [dependencies]
 # Utility stuff
-log = { version = "0.4", features = ["std"] }
-fern = {version = "0.5", features = ["colored"] }
-chrono = "*"
-failure = "*"
-rayon = "*"
-crossbeam = "*"
-serde = { version = "^1.0", optional = true }
-serde_derive = { version = "^1.0", optional = true }
+log = { version = "0.4" }
 pathfinding = "*"
-specs = "*"
+serde = { version = "*", optional = true, features = ["derive"]}
 
 [features]
 default = [ ]
-use_serde = [ "serde", "serde_derive" ]
 
 [dev-dependencies]
-serde_json = "^1.0"
+pretty_assertions = "*"
+chrono = "*"
+fern = {version = "0.5", features = ["colored"] }
+serde_json = "*"
